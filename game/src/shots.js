@@ -1,79 +1,74 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
+// The screenshot scenes behind ?shot=start|play|chase|mission. Each one plays the
+// real rules forward from a fresh world for a fixed number of steps, steered by a
+// simple autopilot, so the frame is what real play looks like and the same seed
+// always gives the same frame.
+import { STEP } from './config.js';
+import { PLACES } from './world.js';
 import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const IDLE = { moveX: 0, moveY: 0, up: false, down: false, steer: 0, run: false };
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function driveInput(world) {
+  // Drive east along the road at y=352 with proportional steering: a small
+  // correction for the angle error to east and for the drift off the centre
+  // line, so the car holds a straight line instead of slaloming.
+  const car = world.state.player.inCar;
+  if (!car) return IDLE;
+  const steer = Math.max(-1, Math.min(1, -car.angle * 1.5 - (car.y - 352) * 0.012));
+  return { moveX: 0, moveY: 0, up: true, down: false, steer, run: false };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function stealNearestCar(world) {
+  const p = world.state.player;
+  const car = world.nearestCar(p.x, p.y, 400);
+  if (!car) return false;
+  // Stage the car on the eastbound road at y=352, facing east, so the drive
+  // autopilot has a straight road ahead of it.
+  car.x = 448;
+  car.y = 352;
+  car.angle = 0;
+  car.speed = 0;
+  world.placePlayer(car.x, car.y - 40);
+  return world.enterCar();
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `world` to the named scene and return the screen to draw over it.
+ * `missions` is the mission runner, so the staged frame shows the real objective.
  */
-export function stageShot(name, world) {
+export function stageShot(name, world, missions) {
   world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  if (name !== 'play' && name !== 'chase' && name !== 'mission') {
+    for (let i = 0; i < 5 / STEP; i += 1) world.step(STEP, IDLE);
+    return { screen: SCREEN_TITLE };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (name === 'mission') {
+    missions.loadProgress(3, 750);
+    world.placePlayer(PLACES.warehouse.x - 220, PLACES.warehouse.y + 60);
+    world.spawnEnforcers(PLACES.warehouse.x, PLACES.warehouse.y, 4);
+    for (let i = 0; i < 2 / STEP; i += 1) {
+      const e = world.state.enforcers.find((x) => !x.down);
+      if (e) {
+        const a = Math.atan2(e.y - world.state.player.y, e.x - world.state.player.x);
+        world.state.player.angle = a;
+        if (i % 20 === 0) world.fireAt(a);
+      }
+      world.step(STEP, IDLE);
+      missions.update(STEP);
+    }
+    return { screen: SCREEN_PLAY };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  // play / chase: steal a car at the safehouse and drive east through traffic.
+  // Four seconds keeps the car mid-city (the city is 2560 px wide) instead of
+  // pinned against its eastern edge.
+  missions.loadProgress(0, 0);
+  world.placePlayer(352, 300);
+  stealNearestCar(world);
+  if (name === 'chase') world.addWanted(3);
+  for (let i = 0; i < 4 / STEP; i += 1) {
+    world.step(STEP, driveInput(world));
+    missions.update(STEP);
+    if (world.state.player.health <= 0) break;
+  }
+  return { screen: world.state.player.health <= 0 ? SCREEN_OVER : SCREEN_PLAY };
 }
